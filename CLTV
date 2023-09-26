@@ -1,0 +1,173 @@
+	###########################################################################
+	#
+	# CLV Analysis: BG/ NBD Probabilistic Model
+	#
+	#
+	# Script:
+	# Generting clv predictions from retail transaction dataset
+	#
+	#
+	# Abhinay Chaudhary
+	###########################################################################
+	
+
+	# Loading required libraries
+	library(lubridate)
+	library(BTYD)
+	library(BTYDplus)
+	library(dplyr)
+	library(ggplot2)
+	
+
+	# reading the transaction dataset
+	df <- read.csv("Online Retail.csv", header = TRUE)
+	head(df)
+	
+
+	range(df$InvoiceDate)
+	
+
+	# We would need an additional column for Sales which will be Quantity times UnitPrice
+	df <- mutate(df, Sales = df$Quantity*df$UnitPrice)
+	head(df)
+	
+
+	# keep only records with customer ID
+	colSums(is.na(df))
+	df <- na.omit(df)
+	
+
+	# keeping only required columns
+	elog = df %>% group_by(CustomerID,InvoiceDate) %>% summarise(Sales = sum(Sales))
+	elog <- as_tibble(elog)
+	head(elog)
+	
+
+	# Removing zero sales (purchase and returns on same date)
+	elog <- dplyr::filter(elog, elog$Sales!=0)
+	head(elog)
+	
+
+	#  we convert the dates in the event log to R Date objects and rename the columns for use in helper functions
+	elog$InvoiceDate <- as.character(elog$InvoiceDate)
+	elog$InvoiceDate <- as.Date(elog$InvoiceDate, "%Y%m%d")
+	names(elog)[1] <- "cust"
+	names(elog)[2] <- "date"
+	names(elog)[3] <- "sales"
+	elog$cust <- as.factor(elog$cust)
+	str(elog)
+	
+
+	# Weekly transaction Analysis
+	op <- par(mfrow = c(1, 2), mar = c(2.5, 2.5, 2.5, 2.5))
+	# incremental
+	weekly_inc_total <- elog2inc(elog, by = 7, first = TRUE)
+	weekly_inc_repeat <- elog2inc(elog, by = 7, first = FALSE)
+	plot(weekly_inc_total, typ = "l", frame = FALSE, main = "Incremental")
+	lines(weekly_inc_repeat, col = "red")
+	# commualtive
+	weekly_cum_total <- elog2cum(elog, by = 7, first = TRUE)
+	weekly_cum_repeat <- elog2cum(elog, by = 7, first = FALSE)
+	plot(weekly_cum_total, typ = "l", frame = FALSE, main = "Cumulative")
+	lines(weekly_cum_repeat, col = "red")
+	par(op)
+	
+
+	# Convert Transaction logs to CBS format
+	calibration_cbs = elog2cbs(elog, units = "week", T.cal = "2011-10-01")
+	head(calibration_cbs)
+	
+
+	# estimate parameters for the model
+	params.bgnbd <- BTYD::bgnbd.EstimateParameters(calibration_cbs) # BG/NBD
+	row <- function(params, LL) {
+	  names(params) <- c("k", "r", "alpha", "a", "b")
+	  c(round(params, 3), LL = round(LL))
+	}
+	rbind(`BG/NBD` = row(c(1, params.bgnbd),
+	                     BTYD::bgnbd.cbs.LL(params.bgnbd, calibration_cbs)))
+	
+
+	# aggregate level dynamics can be visualized with the help of mbgcnbd.PlotTrackingInc
+	nil <- bgnbd.PlotTrackingInc(params.bgnbd,
+	                             T.cal = calibration_cbs$T.cal,
+	                             T.tot = max(calibration_cbs$T.cal + calibration_cbs$T.star),
+	                             actual.inc.tracking = elog2inc(elog))
+	
+
+	# mean absolute error (MAE)
+	mae <- function(act, est) {
+	  stopifnot(length(act)==length(est))
+	  sum(abs(act-est)) / sum(act)
+	}
+	mae.bgnbd <- mae(calibration_cbs$x.star, calibration_cbs$xstar.bgnbd)
+	rbind(
+	  `BG/NBD` = c(`MAE` = round(mae.bgnbd, 3)))
+	
+
+	# Parameters for gamma spend
+	spend_df = elog %>%
+	  group_by(cust) %>%
+	  summarise(average_spend = mean(sales),
+	            total_transactions = n())
+	spend_df$average_spend <- as.integer(spend_df$average_spend)
+	spend_df <- filter(spend_df, spend_df$average_spend>0)
+	
+
+	head(spend_df)
+	
+
+	# parameter values for our Gamma-Gamma spend model
+	gg_params = spend.EstimateParameters(spend_df$average_spend, 
+	                                     spend_df$total_transactions)
+	gg_params
+	
+
+	# Applying model to entire cohort
+	customer_cbs = elog2cbs(elog, units = "week")
+	customer_expected_trans <- data.frame(cust = customer_cbs$cust,
+	                                      expected_transactions = 
+	                                        bgnbd.ConditionalExpectedTransactions(params = params.bgnbd,
+	                                                                              T.star = 12,
+	                                                                              x = customer_cbs[,'x'],
+	                                                                              t.x = customer_cbs[,'t.x'],
+	                                                                              T.cal  = customer_cbs[,'T.cal']))
+	customer_spend = elog %>%
+	  group_by(cust) %>%
+	  summarise(average_spend = mean(sales),
+	            total_transactions = n())
+	customer_spend <- filter(customer_spend, customer_spend$average_spend>0)
+	customer_expected_spend = data.frame(cust = customer_spend$cust,
+	                                     average_expected_spend = 
+	                                       spend.expected.value(gg_params,
+	                                                            m.x = customer_spend$average_spend,
+	                                                            x = customer_spend$total_transactions))
+	
+
+	# Combining these two data frames together gives us the next quarter customer value for each person in our data set.
+	merged_customer_data = customer_expected_trans %>%
+	  full_join(customer_expected_spend) %>%
+	  mutate(clv = expected_transactions * average_expected_spend,
+	         clv_bin = case_when(clv >= quantile(clv, .9, na.rm = TRUE) ~ "high",
+	                             clv >= quantile(clv, .5, na.rm = TRUE) ~ "medium",
+	                             TRUE ~ "low"))
+	head(merged_customer_data)
+	merged_customer_data %>%
+	  group_by(clv_bin) %>%
+	  summarise(n = n())
+	
+
+	# Combining historical spend and forecast togather and saving it as an output csv
+	customer_clv <- left_join(spend_df, merged_customer_data, by ="cust")
+	head(customer_clv)
+	write.csv(customer_clv, "clv_output.csv")
+	
+
+	# Plot of CLV Clusters
+	customer_clv  %>% 
+	  ggplot(aes(x = total_transactions,
+	             y = average_spend,
+	             col = as.factor(clv_bin),
+	             shape = clv_bin))+
+	  geom_point(size = 4,alpha = 0.5)
+
