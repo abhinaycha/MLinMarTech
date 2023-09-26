@@ -1,0 +1,163 @@
+	###########################################################################
+	#
+	# Association Analysis: Market Basket Analysis
+	#
+	#
+	# Script:
+	# Generting cross sell recommendation from retail transaction dataset
+	#
+	#
+	# Abhinay Chaudhary
+	###########################################################################
+	
+
+	library(dplyr)
+	library(arules)
+	library(arulesViz)
+	
+
+	# Orders csv
+	file1.path = "./order_products__train.csv"
+	orders = read.csv(file1.path)
+	head(orders)
+	
+
+	# Products csv
+	file2.path = "./products.csv"
+	products = read.csv(file2.path)
+	head(products)
+	
+
+	# Combining both of them and forming a single transaction dataset -
+	data = left_join(orders, products, by = "product_id") %>% select(order_id, product_name)
+	head(data,50)
+	
+
+	# We can count the number of unique transactions and the number of unique products
+	data %>%
+	  group_by('order_id') %>%
+	  summarize(order.count = n_distinct(order_id))
+	
+
+	data %>%
+	  group_by('product_name') %>%
+	  summarize(product.count = n_distinct(product_name))
+	
+
+	# writing it back to csv
+	write.table(data,file =  "./data.csv", row.names = FALSE, sep = ";", quote = FALSE)
+	
+
+	# create an arules data structure called transactions
+	data.path = "./data.csv"
+	transactions.obj <- read.transactions(file = data.path, format = "single",
+	                                      sep = ";",
+	                                      header = TRUE,
+	                                      cols = c("order_id", "product_name"),
+	                                      rm.duplicates = FALSE,
+	                                      quote = "", skip = 0,
+	                                      encoding = "unknown")
+	
+
+	# inspecting the newly created transactions object transaction.obj
+	transactions.obj
+	
+
+	data.frame(head(sort(itemFrequency(transactions.obj, type = "absolute"), decreasing = TRUE), 10)) # Most frequent
+	
+
+	data.frame(head(sort(itemFrequency(transactions.obj, type = "absolute"), decreasing = FALSE), 10)) # Least frequent
+	
+
+	# itemFrequencyPlot function to visualize the item frequency
+	itemFrequencyPlot(transactions.obj,topN = 25)
+	
+
+	# Interest Measures
+	support <- 0.005
+	# Frequent item sets
+	parameters = list(
+	  support = support,
+	  minlen = 2, # Minimal number of items per item set
+	  maxlen = 10, # Maximal number of items per item set
+	  target = "frequent itemsets")
+	freq.items <- apriori(transactions.obj, parameter = parameters)
+	
+
+	str(freq.items)
+	
+
+	# Let us examine our freq item sites
+	freq.items.df <- data.frame(item_set = labels(freq.items)
+	                            , support = freq.items@quality)
+	head(freq.items.df,10)
+	
+
+	tail(freq.items.df)
+	
+
+	
+
+	confidence <- 0.2 # Interest Measure
+	
+
+	parameters = list(
+	  support = support,
+	  confidence = confidence,
+	  minlen = 2, # Minimal number of items per item set
+	  maxlen = 10, # Maximal number of items per item set
+	  target = "rules"
+	)
+	rules <- apriori(transactions.obj, parameter = parameters)
+	
+
+	# output data frame, rules.df
+	rules.df <- data.frame(rules = labels(rules), rules@quality)
+	head(rules.df)
+	
+
+	# is.significant method to do a Fisher test of independence
+	is.significant(rules, transactions.obj, method = "fisher")
+	
+
+	# top N rules
+	find.rules <- function(transactions,topN = 10){
+	  
+	  other.im <- interestMeasure(rules, transactions = transactions)
+	  
+	  rules.df <- cbind(rules.df, other.im[,c('conviction','leverage')])
+	  
+	  
+	  # Keep the best rule based on the interest measure
+	  best.rules.df <- head(rules.df[order(-rules.df$leverage),],topN)
+	  
+	  return(best.rules.df)
+	}
+	
+
+	cross.sell.rules <- find.rules(transactions.obj)
+	cross.sell.rules$rules <- as.character(cross.sell.rules$rules)
+	cross.sell.rules
+	
+
+	library(igraph)
+	
+
+	# visualize the rules
+	plot.graph <- function(cross.sell.rules){
+	  edges <- unlist(lapply(cross.sell.rules['rules'], strsplit, split='=>'))
+	  
+	  g <- graph(edges = edges)
+	  plot(g)
+	}
+	plot.graph(cross.sell.rules)
+	
+
+	# The arules package provides the method (HITS)
+	weights.vector <- hits( transactions.obj, type = "relative")
+	weights.df <- data.frame(transactionID = labels(weights.vector), weight = weights.vector)
+	
+
+	head(weights.df)
+
+
